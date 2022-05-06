@@ -3,7 +3,7 @@
 //! See product specification, chapter 31.
 
 use core::ops::Deref;
-use core::sync::atomic::{compiler_fence, Ordering::SeqCst};
+use core::sync::atomic::{compiler_fence, Ordering};
 
 #[cfg(any(feature = "9160", feature = "5340-app"))]
 use crate::pac::{spim0_ns as spim0, SPIM0_NS as SPIM0};
@@ -29,6 +29,16 @@ use crate::gpio::{Floating, Input, Output, Pin, PushPull};
 use crate::target_constants::{EASY_DMA_SIZE, FORCE_COPY_BUFFER_SIZE};
 use crate::{slice_in_ram, slice_in_ram_or, DmaSlice};
 use embedded_hal::digital::v2::OutputPin;
+
+/// SPIM events
+#[derive(Debug, Eq, PartialEq, Clone, Copy)]
+pub enum SpimEvent {
+    End,
+    EndRx,
+    EndTx,
+    Stopped,
+    Started,
+}
 
 /// Interface to a SPIM instance.
 ///
@@ -86,6 +96,56 @@ impl<T> Spim<T>
 where
     T: Instance,
 {
+    /// Enables interrupt for specified event.
+    #[inline(always)]
+    pub fn enable_interrupt(&self, event: SpimEvent) -> &Self {
+        self.0.intenset.modify(|_r, w| match event {
+            SpimEvent::End => w.end().set_bit(),
+            SpimEvent::EndRx => w.endrx().set_bit(),
+            SpimEvent::EndTx => w.endtx().set_bit(),
+            SpimEvent::Stopped => w.stopped().set_bit(),
+            SpimEvent::Started => w.started().set_bit(),
+        });
+        self
+    }
+
+    /// Disables interrupt for specified event.
+    #[inline(always)]
+    pub fn disable_interrupt(&self, event: SpimEvent) -> &Self {
+        self.0.intenclr.write(|w| match event {
+            SpimEvent::End => w.end().set_bit(),
+            SpimEvent::EndRx => w.endrx().set_bit(),
+            SpimEvent::EndTx => w.endtx().set_bit(),
+            SpimEvent::Stopped => w.stopped().set_bit(),
+            SpimEvent::Started => w.started().set_bit(),
+        });
+        self
+    }
+
+    /// Resets specified event.
+    #[inline(always)]
+    pub fn reset_event(&self, event: SpimEvent) {
+        match event {
+            SpimEvent::End => self.0.events_end.reset(),
+            SpimEvent::EndRx => self.0.events_endrx.reset(),
+            SpimEvent::EndTx => self.0.events_endtx.reset(),
+            SpimEvent::Stopped => self.0.events_stopped.reset(),
+            SpimEvent::Started => self.0.events_started.reset(),
+        };
+    }
+
+    /// Checks if specified event has been triggered.
+    #[inline(always)]
+    pub fn is_event_triggered(&self, event: SpimEvent) -> bool {
+        match event {
+            SpimEvent::End => self.0.events_end.read().bits() != 0,
+            SpimEvent::EndRx => self.0.events_endrx.read().bits() != 0,
+            SpimEvent::EndTx => self.0.events_endtx.read().bits() != 0,
+            SpimEvent::Stopped => self.0.events_stopped.read().bits() != 0,
+            SpimEvent::Started => self.0.events_started.read().bits() != 0,
+        }
+    }
+
     fn spi_dma_no_copy(&mut self, chunk: &[u8]) -> Result<(), Error> {
         self.do_spi_dma_transfer(DmaSlice::from_slice(chunk), DmaSlice::null())
     }
@@ -162,7 +222,7 @@ where
         // Conservative compiler fence to prevent optimizations that do not
         // take in to account actions by DMA. The fence has been placed here,
         // before any DMA action has started.
-        compiler_fence(SeqCst);
+        compiler_fence(Ordering::SeqCst);
 
         // Set up the DMA write.
         self.0.txd.ptr.write(|w| unsafe { w.ptr().bits(tx.ptr) });
@@ -192,21 +252,21 @@ where
         // Conservative compiler fence to prevent optimizations that do not
         // take in to account actions by DMA. The fence has been placed here,
         // after all possible DMA actions have completed.
-        compiler_fence(SeqCst);
+        compiler_fence(Ordering::SeqCst);
 
         // Wait for END event.
         //
         // This event is triggered once both transmitting and receiving are
         // done.
-        while self.0.events_end.read().bits() == 0 {}
+        while !self.is_done() {}
 
         // Reset the event, otherwise it will always read `1` from now on.
-        self.0.events_end.write(|w| w);
+        self.reset_done();
 
         // Conservative compiler fence to prevent optimizations that do not
         // take in to account actions by DMA. The fence has been placed here,
         // after all possible DMA actions have completed.
-        compiler_fence(SeqCst);
+        compiler_fence(Ordering::SeqCst);
 
         if self.0.txd.amount.read().bits() != tx.len {
             return Err(Error::Transmit);
@@ -215,6 +275,14 @@ where
             return Err(Error::Receive);
         }
         Ok(())
+    }
+
+    fn is_done(&self) -> bool {
+        self.0.events_end.read().bits() != 0
+    }
+
+    fn reset_done(&mut self) {
+        self.0.events_end.write(|w| w);
     }
 
     /// Read and write from a SPI slave, using a single buffer.
@@ -242,6 +310,55 @@ where
         chip_select.set_high().unwrap();
 
         res
+    }
+
+    pub fn dma_transfer<W, B>(self, mut buffer: B) -> DmaTransfer<T, B>
+    where
+        B: embedded_dma::WriteBuffer<Word = W> + 'static,
+    {
+        let (ptr, len) = unsafe { buffer.write_buffer() };
+        let maxcnt = len * core::mem::size_of::<W>();
+        if maxcnt > EASY_DMA_SIZE {
+            panic!("Buffer too long");
+        }
+        if !slice_in_ram(unsafe { core::slice::from_raw_parts(ptr as *const u8, len) }) {
+            panic!("Buffer not in ram");
+        }
+
+        compiler_fence(Ordering::SeqCst);
+
+        // Set up the DMA write.
+        self.0
+            .txd
+            .ptr
+            .write(|w| unsafe { w.ptr().bits(ptr as u32) });
+
+        self.0
+            .txd
+            .maxcnt
+            .write(|w| unsafe { w.maxcnt().bits(len as _) });
+
+        // Set up the DMA read.
+        self.0
+            .rxd
+            .ptr
+            .write(|w| unsafe { w.ptr().bits(ptr as u32) });
+        self.0
+            .rxd
+            .maxcnt
+            .write(|w| unsafe { w.maxcnt().bits(len as _) });
+
+        // Start SPI transaction.
+        self.0.tasks_start.write(|w| unsafe { w.bits(1) });
+
+        // Conservative compiler fence to prevent optimizations that do not
+        // take in to account actions by DMA. The fence has been placed here,
+        // after all possible DMA actions have completed.
+        compiler_fence(Ordering::SeqCst);
+
+        DmaTransfer {
+            inner: DmaInner { buffer, spim: self },
+        }
     }
 
     /// Read and write from a SPI slave, using separate read and write buffers.
@@ -384,6 +501,35 @@ where
     }
 }
 
+/// A DMA transfer
+pub struct DmaTransfer<T: Instance, B> {
+    inner: DmaInner<T, B>,
+}
+
+struct DmaInner<T: Instance, B> {
+    buffer: B,
+    spim: Spim<T>,
+}
+
+impl<T: Instance, B> DmaTransfer<T, B> {
+    /// Blocks until the transfer is done and returns the buffer.
+    pub fn wait(self) -> (B, Spim<T>) {
+        let mut inner = self.inner;
+
+        while !inner.spim.is_done() {}
+        inner.spim.reset_done();
+        compiler_fence(Ordering::SeqCst);
+
+        (inner.buffer, inner.spim)
+    }
+
+    /// Checks if the granted transfer is done.
+    #[inline(always)]
+    pub fn is_done(&self) -> bool {
+        self.inner.spim.is_done()
+    }
+}
+
 /// GPIO pins for SPIM interface
 pub struct Pins {
     /// SPI clock
@@ -409,14 +555,20 @@ pub enum Error {
 }
 
 /// Implemented by all SPIM instances.
-pub trait Instance: Deref<Target = spim0::RegisterBlock> + sealed::Sealed {}
+pub trait Instance: Deref<Target = spim0::RegisterBlock> + sealed::Sealed {
+    fn ptr() -> *const spim0::RegisterBlock;
+}
 
 mod sealed {
     pub trait Sealed {}
 }
 
 impl sealed::Sealed for SPIM0 {}
-impl Instance for SPIM0 {}
+impl Instance for SPIM0 {
+    fn ptr() -> *const spim0::RegisterBlock {
+        SPIM0::ptr()
+    }
+}
 
 #[cfg(any(
     feature = "52832",
@@ -426,20 +578,32 @@ impl Instance for SPIM0 {}
 ))]
 mod _spim1 {
     use super::*;
-    impl Instance for SPIM1 {}
+    impl Instance for SPIM1 {
+        fn ptr() -> *const spim0::RegisterBlock {
+            SPIM1::ptr()
+        }
+    }
     impl sealed::Sealed for SPIM1 {}
 }
 
 #[cfg(any(feature = "52832", feature = "52833", feature = "52840"))]
 mod _spim2 {
     use super::*;
-    impl Instance for SPIM2 {}
+    impl Instance for SPIM2 {
+        fn ptr() -> *const spim0::RegisterBlock {
+            SPIM2::ptr()
+        }
+    }
     impl sealed::Sealed for SPIM2 {}
 }
 
 #[cfg(any(feature = "52833", feature = "52840"))]
 mod _spim3 {
     use super::*;
-    impl Instance for SPIM3 {}
+    impl Instance for SPIM3 {
+        fn ptr() -> *const spim0::RegisterBlock {
+            SPIM3::ptr()
+        }
+    }
     impl sealed::Sealed for SPIM3 {}
 }
