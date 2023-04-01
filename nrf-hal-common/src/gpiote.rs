@@ -1,42 +1,18 @@
-//! HAL interface for the GPIOTE peripheral.
-//!
-//! The GPIO tasks and events (GPIOTE) module provides functionality for accessing GPIO pins using
-//! tasks and events.
-
-#[cfg(feature = "51")]
-use crate::pac::GPIO as P0;
-
-#[cfg(any(feature = "9160", feature = "5340-net"))]
-use crate::pac::P0_NS as P0;
-
-#[cfg(not(any(feature = "51", feature = "9160", feature = "5340-net")))]
-use crate::pac::P0;
-
-#[cfg(any(feature = "52833", feature = "52840"))]
-use crate::pac::P1;
-
-#[cfg(feature = "5340-net")]
-use crate::pac::P1_NS as P1;
-
-use crate::gpio::{
-    Floating, Input, Level, OpenDrain, Output, Pin, Port, PullDown, PullUp, PushPull,
-};
-
 #[cfg(not(any(feature = "9160", feature = "5340-net")))]
 use {
-    crate::pac::gpiote::{EVENTS_IN, EVENTS_PORT, TASKS_OUT},
+    crate::pac::gpiote::{EVENTS_IN, TASKS_OUT},
     crate::pac::GPIOTE,
 };
 
 #[cfg(feature = "9160")]
 use {
-    crate::pac::gpiote0_s::{EVENTS_IN, EVENTS_PORT, TASKS_CLR, TASKS_OUT, TASKS_SET},
+    crate::pac::gpiote0_s::{EVENTS_IN, TASKS_CLR, TASKS_OUT, TASKS_SET},
     crate::pac::GPIOTE1_NS as GPIOTE,
 };
 
 #[cfg(feature = "5340-net")]
 use {
-    crate::pac::gpiote_ns::{EVENTS_IN, EVENTS_PORT, TASKS_CLR, TASKS_OUT, TASKS_SET},
+    crate::pac::gpiote_ns::{EVENTS_IN, TASKS_CLR, TASKS_OUT, TASKS_SET},
     crate::pac::GPIOTE_NS as GPIOTE,
 };
 
@@ -48,347 +24,378 @@ const NUM_CHANNELS: usize = 8;
 #[cfg(feature = "51")]
 const NUM_CHANNELS: usize = 4;
 
-/// A safe wrapper around the GPIOTE peripheral.
-pub struct Gpiote {
+use crate::{
+    gpio::{Floating, Input, Pin, Port, PullDown, PullUp},
+    waker_registration::CriticalSectionWakerRegistration,
+    InterruptToken,
+};
+use core::task::Poll;
+use cortex_m::peripheral::NVIC;
+use embedded_hal::digital::InputPin;
+
+// TODO: Figure out how to do this
+#[macro_export]
+macro_rules! register_gpiote_interrupt {
+    ($token_name:ident) => {
+        pub struct $token_name;
+
+        unsafe impl async_nrf52832_hal::InterruptToken<async_nrf52832_hal::gpiote::export::GPIOTE>
+            for $token_name
+        {
+        }
+
+        #[no_mangle]
+        #[allow(non_snake_case)]
+        unsafe extern "C" fn GPIOTE() {
+            async_nrf52832_hal::gpiote::export::on_interrupt_gpiote();
+        }
+    };
+}
+
+// Hidden export only for use by the macro
+#[doc(hidden)]
+pub mod export {
+    pub use crate::pac::GPIOTE;
+
+    /// This happens on interrupt.
+    pub fn on_interrupt_gpiote() {
+        let gpiote = unsafe { &*GPIOTE::ptr() };
+
+        for ch in 0..8 {
+            if gpiote.events_in[ch].read().bits() != 0 {
+                gpiote.intenclr.write(|w| unsafe { w.bits(1 << ch) });
+                super::WAKER_REGISTRATION[ch].wake();
+            }
+        }
+    }
+}
+
+const NEW_WAKER_REG: CriticalSectionWakerRegistration = CriticalSectionWakerRegistration::new();
+
+// Waker registration for each GPIOTE channel.
+static WAKER_REGISTRATION: [CriticalSectionWakerRegistration; NUM_CHANNELS] =
+    [NEW_WAKER_REG; NUM_CHANNELS];
+
+/// Uninit state for a gpiote channel
+pub struct Uninit;
+
+/// Configured state for a gpiote channel with a pin
+pub struct Configured<Pin>(Pin);
+
+/// Convert the Gpiote to its channels and set the priority of the GPIOTE interrupt.
+#[inline(always)]
+pub fn new_with_priority(
     gpiote: GPIOTE,
+    interrupt_token: impl InterruptToken<GPIOTE>,
+    nvic: &mut NVIC,
+    prio: u8,
+) -> (
+    Channel<0, Uninit>,
+    Channel<1, Uninit>,
+    Channel<2, Uninit>,
+    Channel<3, Uninit>,
+    Channel<4, Uninit>,
+    Channel<5, Uninit>,
+    Channel<6, Uninit>,
+    Channel<7, Uninit>,
+) {
+    unsafe { nvic.set_priority(crate::pac::Interrupt::GPIOTE, prio) };
+
+    new(gpiote, interrupt_token)
 }
 
-impl Gpiote {
-    /// Takes ownership of the `GPIOTE` peripheral, returning a safe wrapper.
-    pub fn new(gpiote: GPIOTE) -> Self {
-        Self { gpiote }
+/// Return from new
+#[cfg(not(feature = "51"))]
+pub type GpioteNewReturn = (
+    Channel<0, Uninit>,
+    Channel<1, Uninit>,
+    Channel<2, Uninit>,
+    Channel<3, Uninit>,
+    Channel<4, Uninit>,
+    Channel<5, Uninit>,
+    Channel<6, Uninit>,
+    Channel<7, Uninit>,
+);
+#[cfg(feature = "51")]
+pub type GpioteNewReturn = (
+    Channel<0, Uninit>,
+    Channel<1, Uninit>,
+    Channel<2, Uninit>,
+    Channel<3, Uninit>,
+);
+
+#[cfg(not(feature = "51"))]
+const GPIOTE_NEW: GpioteNewReturn = (
+    Channel { conf: Uninit },
+    Channel { conf: Uninit },
+    Channel { conf: Uninit },
+    Channel { conf: Uninit },
+    Channel { conf: Uninit },
+    Channel { conf: Uninit },
+    Channel { conf: Uninit },
+    Channel { conf: Uninit },
+);
+#[cfg(feature = "51")]
+const GPIOTE_NEW: GpioteNewReturn = (
+    Channel { conf: Uninit },
+    Channel { conf: Uninit },
+    Channel { conf: Uninit },
+    Channel { conf: Uninit },
+);
+
+/// Convert the Gpiote to its channels
+pub fn new(gpiote: GPIOTE, _interrupt_token: impl InterruptToken<GPIOTE>) -> GpioteNewReturn {
+    // Clear any old pending interrupts
+    gpiote.intenclr.write(|w| unsafe { w.bits(0xff) });
+    for ch in 0..NUM_CHANNELS {
+        gpiote.events_in[ch].write(|w| w);
     }
 
-    fn channel(&self, channel: usize) -> GpioteChannel {
-        GpioteChannel {
-            gpiote: &self.gpiote,
-            channel,
+    unsafe { NVIC::unmask(crate::pac::Interrupt::GPIOTE) };
+
+    GPIOTE_NEW
+}
+
+/// A Gpiote channel
+#[derive(Clone)]
+pub struct Channel<const CH: usize, T> {
+    conf: T,
+}
+
+impl<const CH: usize> Channel<CH, Uninit> {
+    /// Configure a channel
+    pub fn configure<Pin>(self, input_pin: Pin) -> Channel<CH, Configured<Pin>>
+    where
+        Pin: GpioteInputPin,
+    {
+        let gpiote = unsafe { &*GPIOTE::ptr() };
+
+        gpiote.config[CH].write(|w| unsafe { w.psel().bits(input_pin.pin()) });
+
+        // TODO: Is port event needed?
+        // gpiote.intenset.write(|w| w.port().set());
+
+        Channel {
+            conf: Configured(input_pin),
         }
-    }
-    pub fn channel0(&self) -> GpioteChannel {
-        self.channel(0)
-    }
-    pub fn channel1(&self) -> GpioteChannel {
-        self.channel(1)
-    }
-    pub fn channel2(&self) -> GpioteChannel {
-        self.channel(2)
-    }
-    pub fn channel3(&self) -> GpioteChannel {
-        self.channel(3)
-    }
-    #[cfg(not(feature = "51"))]
-    pub fn channel4(&self) -> GpioteChannel {
-        self.channel(4)
-    }
-    #[cfg(not(feature = "51"))]
-    pub fn channel5(&self) -> GpioteChannel {
-        self.channel(5)
-    }
-    #[cfg(not(feature = "51"))]
-    pub fn channel6(&self) -> GpioteChannel {
-        self.channel(6)
-    }
-    #[cfg(not(feature = "51"))]
-    pub fn channel7(&self) -> GpioteChannel {
-        self.channel(7)
-    }
-
-    pub fn port(&self) -> GpiotePort {
-        GpiotePort {
-            gpiote: &self.gpiote,
-        }
-    }
-
-    /// Marks all GPIOTE events as handled
-    pub fn reset_events(&self) {
-        (0..NUM_CHANNELS).for_each(|ch| self.gpiote.events_in[ch].write(|w| w));
-        self.gpiote.events_port.write(|w| w);
-    }
-
-    /// Consumes `self` and return back the raw `GPIOTE` peripheral.
-    pub fn free(self) -> GPIOTE {
-        self.gpiote
     }
 }
 
-pub struct GpioteChannel<'a> {
-    gpiote: &'a GPIOTE,
-    channel: usize,
-}
-
-impl<'a> GpioteChannel<'_> {
-    /// Configures the channel as an event input with associated pin.
-    pub fn input_pin<P: GpioteInputPin>(&'a self, pin: &'a P) -> GpioteChannelEvent<'a, P> {
-        GpioteChannelEvent {
-            gpiote: &self.gpiote,
-            pin: pin,
-            channel: self.channel,
-        }
-    }
-    /// Configures the channel as a task output with associated pin.
-    pub fn output_pin<P: GpioteOutputPin>(&'a self, pin: P) -> GpioteTask<'a, P> {
-        GpioteTask {
-            gpiote: &self.gpiote,
-            pin: pin,
-            channel: self.channel,
-            task_out_polarity: TaskOutPolarity::Toggle,
+impl<const CH: usize, Pin> Channel<CH, Configured<Pin>>
+where
+    Pin: InputPin,
+{
+    /// Enable interrupts from this channel.
+    fn enable_interrupt() {
+        // SAFETY: Atomic write.
+        unsafe {
+            let gpiote = &*GPIOTE::ptr();
+            gpiote.intenset.write(|w| w.bits(1 << CH));
         }
     }
 
-    /// Checks if the channel event has been triggered.
-    pub fn is_event_triggered(&self) -> bool {
-        self.gpiote.events_in[self.channel].read().bits() != 0
-    }
-    /// Resets channel events.
-    pub fn reset_events(&self) {
-        self.gpiote.events_in[self.channel].write(|w| w);
+    /// Disable interrupts from this channel.
+    fn disable_interrupt() {
+        // SAFETY: Atomic write.
+        unsafe {
+            let gpiote = &*GPIOTE::ptr();
+            gpiote.intenclr.write(|w| w.bits(1 << CH));
+        }
     }
 
-    /// Triggers `task out` (as configured with task_out_polarity, defaults to Toggle).
-    pub fn out(&self) {
-        self.gpiote.tasks_out[self.channel].write(|w| unsafe { w.bits(1) });
+    /// Checks if the event is triggered on this channel.
+    fn is_event_triggered() -> bool {
+        // SAFETY: Atomic read.
+        unsafe {
+            let gpiote = &*GPIOTE::ptr();
+            gpiote.events_in[CH].read().bits() != 0
+        }
     }
-    /// Triggers `task set` (set associated pin high).
-    #[cfg(not(feature = "51"))]
-    pub fn set(&self) {
-        self.gpiote.tasks_set[self.channel].write(|w| unsafe { w.bits(1) });
+
+    /// Resets the event on this channel.
+    fn reset_events() {
+        // SAFETY: Atomic write.
+        unsafe {
+            let gpiote = &*GPIOTE::ptr();
+            gpiote.events_in[CH].write(|w| w);
+        }
     }
-    /// Triggers `task clear` (set associated pin low).
-    #[cfg(not(feature = "51"))]
-    pub fn clear(&self) {
-        self.gpiote.tasks_clr[self.channel].write(|w| unsafe { w.bits(1) });
+
+    fn set_trigger(trigger_mode: EventPolarity) {
+        let gpiote = unsafe { &*GPIOTE::ptr() };
+        gpiote.config[CH].modify(|_, w| match trigger_mode {
+            EventPolarity::HiToLo => w.mode().event().polarity().hi_to_lo(),
+            EventPolarity::LoToHi => w.mode().event().polarity().lo_to_hi(),
+            EventPolarity::None => w.mode().event().polarity().none(),
+            EventPolarity::Toggle => w.mode().event().polarity().toggle(),
+        });
     }
 
     /// Returns reference to channel event endpoint for PPI.
     pub fn event(&self) -> &EVENTS_IN {
-        &self.gpiote.events_in[self.channel]
+        let gpiote = unsafe { &*GPIOTE::ptr() };
+        &gpiote.events_in[CH]
     }
 
     /// Returns reference to task_out endpoint for PPI.
     pub fn task_out(&self) -> &TASKS_OUT {
-        &self.gpiote.tasks_out[self.channel]
+        let gpiote = unsafe { &*GPIOTE::ptr() };
+        &gpiote.tasks_out[CH]
     }
 
     /// Returns reference to task_clr endpoint for PPI.
     #[cfg(not(feature = "51"))]
     pub fn task_clr(&self) -> &TASKS_CLR {
-        &self.gpiote.tasks_clr[self.channel]
+        let gpiote = unsafe { &*GPIOTE::ptr() };
+        &gpiote.tasks_clr[CH]
     }
 
     /// Returns reference to task_set endpoint for PPI.
     #[cfg(not(feature = "51"))]
     pub fn task_set(&self) -> &TASKS_SET {
-        &self.gpiote.tasks_set[self.channel]
+        let gpiote = unsafe { &*GPIOTE::ptr() };
+        &gpiote.tasks_set[CH]
     }
-}
 
-pub struct GpiotePort<'a> {
-    gpiote: &'a GPIOTE,
-}
+    /// Main API for waiting on a pin.
+    async fn wait_for(&mut self, waiting_for: WaitingFor) {
+        let dropper = crate::OnDrop::new(|| {
+            Self::disable_interrupt();
+            Self::reset_events();
+        });
 
-impl<'a> GpiotePort<'_> {
-    /// Configures associated pin as port event trigger.
-    pub fn input_pin<P: GpioteInputPin>(&'a self, pin: &'a P) -> GpiotePortEvent<'a, P> {
-        GpiotePortEvent { pin }
-    }
-    /// Enables GPIOTE interrupt for port events.
-    pub fn enable_interrupt(&self) {
-        self.gpiote.intenset.write(|w| w.port().set());
-    }
-    /// Disables GPIOTE interrupt for port events.
-    pub fn disable_interrupt(&self) {
-        self.gpiote.intenclr.write(|w| w.port().set_bit());
-    }
-    /// Checks if port event has been triggered.
-    pub fn is_event_triggered(&self) -> bool {
-        self.gpiote.events_port.read().bits() != 0
-    }
-    /// Marks port events as handled.
-    pub fn reset_events(&self) {
-        self.gpiote.events_port.write(|w| w);
-    }
-    /// Returns reference to port event endpoint for PPI.
-    pub fn event(&self) -> &EVENTS_PORT {
-        &self.gpiote.events_port
-    }
-}
+        Self::reset_events();
 
-pub struct GpioteChannelEvent<'a, P: GpioteInputPin> {
-    gpiote: &'a GPIOTE,
-    pin: &'a P,
-    channel: usize,
-}
+        core::future::poll_fn(|cx| {
+            Self::disable_interrupt();
 
-impl<'a, P: GpioteInputPin> GpioteChannelEvent<'_, P> {
-    /// Generates event on falling edge.
-    pub fn hi_to_lo(&self) -> &Self {
-        config_channel_event_pin(self.gpiote, self.channel, self.pin, EventPolarity::HiToLo);
-        self
-    }
-    /// Generates event on rising edge.
-    pub fn lo_to_hi(&self) -> &Self {
-        config_channel_event_pin(self.gpiote, self.channel, self.pin, EventPolarity::LoToHi);
-        self
-    }
-    /// Generates event on any pin activity.
-    pub fn toggle(&self) -> &Self {
-        config_channel_event_pin(self.gpiote, self.channel, self.pin, EventPolarity::Toggle);
-        self
-    }
-    /// No event is generated on pin activity.
-    pub fn none(&self) -> &Self {
-        config_channel_event_pin(self.gpiote, self.channel, self.pin, EventPolarity::None);
-        self
-    }
-    /// Enables GPIOTE interrupt for channel.
-    pub fn enable_interrupt(&self) -> &Self {
-        unsafe { self.gpiote.intenset.write(|w| w.bits(1 << self.channel)) }
-        self
-    }
-    /// Disables GPIOTE interrupt for channel.
-    pub fn disable_interrupt(&self) -> &Self {
-        unsafe { self.gpiote.intenclr.write(|w| w.bits(1 << self.channel)) }
-        self
-    }
-}
-
-fn config_channel_event_pin<P: GpioteInputPin>(
-    gpiote: &GPIOTE,
-    channel: usize,
-    pin: &P,
-    trigger_mode: EventPolarity,
-) {
-    // Config pin as event-triggering input for specified edge transition trigger mode.
-    gpiote.config[channel].write(|w| {
-        match trigger_mode {
-            EventPolarity::HiToLo => w.mode().event().polarity().hi_to_lo(),
-            EventPolarity::LoToHi => w.mode().event().polarity().lo_to_hi(),
-            EventPolarity::None => w.mode().event().polarity().none(),
-            EventPolarity::Toggle => w.mode().event().polarity().toggle(),
-        };
-
-        #[cfg(any(feature = "52833", feature = "52840"))]
-        {
-            match pin.port() {
-                Port::Port0 => w.port().clear_bit(),
-                Port::Port1 => w.port().set_bit(),
-            };
-        }
-
-        unsafe { w.psel().bits(pin.pin()) }
-    });
-}
-
-pub struct GpiotePortEvent<'a, P: GpioteInputPin> {
-    pin: &'a P,
-}
-
-impl<'a, P: GpioteInputPin> GpiotePortEvent<'_, P> {
-    /// Generates event on pin low.
-    pub fn low(&self) {
-        config_port_event_pin(self.pin, PortEventSense::Low);
-    }
-    /// Generates event on pin high.
-    pub fn high(&self) {
-        config_port_event_pin(self.pin, PortEventSense::High);
-    }
-    /// No event is generated on pin activity.
-    pub fn disabled(&self) {
-        config_port_event_pin(self.pin, PortEventSense::Disabled);
-    }
-}
-
-fn config_port_event_pin<P: GpioteInputPin>(pin: &P, sense: PortEventSense) {
-    // Set pin sense to specified mode to trigger port events.
-    unsafe {
-        &(*{
-            match pin.port() {
-                Port::Port0 => P0::ptr(),
-                #[cfg(any(feature = "52833", feature = "52840", feature = "5340-net"))]
-                Port::Port1 => P1::ptr(),
+            match waiting_for {
+                WaitingFor::RisingEdge | WaitingFor::FallingEdge | WaitingFor::AnyEdge => {
+                    if Self::is_event_triggered() {
+                        return Poll::Ready(());
+                    }
+                }
+                _ => {}
             }
+
+            Self::reset_events();
+
+            match waiting_for {
+                WaitingFor::High => {
+                    // Check fall through
+                    if matches!(self.conf.0.is_high(), Ok(true)) {
+                        return Poll::Ready(());
+                    }
+
+                    Self::set_trigger(EventPolarity::LoToHi);
+                }
+                WaitingFor::Low => {
+                    // Check fall through
+                    if matches!(self.conf.0.is_low(), Ok(true)) {
+                        return Poll::Ready(());
+                    }
+
+                    Self::set_trigger(EventPolarity::HiToLo);
+                }
+                WaitingFor::RisingEdge => {
+                    Self::set_trigger(EventPolarity::LoToHi);
+                }
+                WaitingFor::FallingEdge => {
+                    Self::set_trigger(EventPolarity::HiToLo);
+                }
+                WaitingFor::AnyEdge => {
+                    Self::set_trigger(EventPolarity::Toggle);
+                }
+            }
+
+            WAKER_REGISTRATION[CH].register(cx.waker());
+
+            // Enable interrupts after registration
+            Self::enable_interrupt();
+
+            Poll::Pending
         })
-        .pin_cnf[pin.pin() as usize]
-    }
-    .modify(|_r, w| match sense {
-        PortEventSense::Disabled => w.sense().disabled(),
-        PortEventSense::High => w.sense().high(),
-        PortEventSense::Low => w.sense().low(),
-    });
-}
+        .await;
 
-pub struct GpioteTask<'a, P: GpioteOutputPin> {
-    gpiote: &'a GPIOTE,
-    pin: P,
-    channel: usize,
-    task_out_polarity: TaskOutPolarity,
-}
+        dropper.defuse();
+    }
 
-impl<'a, P: GpioteOutputPin> GpioteTask<'_, P> {
-    /// Sets initial task output pin state to high.
-    pub fn init_high(&self) {
-        config_channel_task_pin(
-            self.gpiote,
-            self.channel,
-            &self.pin,
-            &self.task_out_polarity,
-            Level::High,
-        );
-    }
-    /// Sets initial task output pin state to low.
-    pub fn init_low(&self) {
-        config_channel_task_pin(
-            self.gpiote,
-            self.channel,
-            &self.pin,
-            &self.task_out_polarity,
-            Level::Low,
-        );
-    }
-    /// Configures polarity of the `task out` operation.
-    pub fn task_out_polarity(&mut self, polarity: TaskOutPolarity) -> &mut Self {
-        self.task_out_polarity = polarity;
-        self
+    /// Free the channel an pin.
+    pub fn free(self) -> (Pin, Channel<CH, Uninit>) {
+        Self::disable_interrupt();
+        Self::reset_events();
+
+        let gpiote = unsafe { &*GPIOTE::ptr() };
+        gpiote.config[CH].write(|w| w);
+
+        (self.conf.0, Channel { conf: Uninit })
     }
 }
 
-fn config_channel_task_pin<P: GpioteOutputPin>(
-    gpiote: &GPIOTE,
-    channel: usize,
-    pin: &P,
-    task_out_polarity: &TaskOutPolarity,
-    init_out: Level,
-) {
-    // Config pin as task output with specified initial state and task out polarity.
-    gpiote.config[channel].write(|w| {
-        match init_out {
-            Level::High => w.mode().task().outinit().high(),
-            Level::Low => w.mode().task().outinit().low(),
-        };
-        match task_out_polarity {
-            TaskOutPolarity::Set => w.polarity().lo_to_hi(),
-            TaskOutPolarity::Clear => w.polarity().hi_to_lo(),
-            TaskOutPolarity::Toggle => w.polarity().toggle(),
-        };
+// A channel's pin can be read like any input pin.
+impl<const CH: usize, Pin> InputPin for Channel<CH, Configured<Pin>>
+where
+    Pin: InputPin,
+{
+    fn is_low(&self) -> Result<bool, Self::Error> {
+        self.conf.0.is_low()
+    }
 
-        #[cfg(any(feature = "52833", feature = "52840", feature = "5340-net"))]
-        {
-            match pin.port() {
-                Port::Port0 => w.port().clear_bit(),
-                Port::Port1 => w.port().set_bit(),
-            };
-        }
-
-        unsafe { w.psel().bits(pin.pin()) }
-    });
+    fn is_high(&self) -> Result<bool, Self::Error> {
+        self.conf.0.is_high()
+    }
 }
 
-/// Polarity of the `task out` operation.
-pub enum TaskOutPolarity {
-    Set,
-    Clear,
-    Toggle,
+// Error type for the async traits.
+impl<const CH: usize, Pin> embedded_hal::digital::ErrorType for Channel<CH, Configured<Pin>>
+where
+    Pin: InputPin,
+{
+    type Error = <Pin as embedded_hal::digital::ErrorType>::Error;
+}
+
+impl<const CH: usize, Pin> embedded_hal_async::digital::Wait for Channel<CH, Configured<Pin>>
+where
+    Pin: GpioteInputPin + InputPin,
+{
+    #[inline(always)]
+    async fn wait_for_high(&mut self) -> Result<(), Self::Error> {
+        self.wait_for(WaitingFor::High).await;
+        Ok(())
+    }
+
+    #[inline(always)]
+    async fn wait_for_low(&mut self) -> Result<(), Self::Error> {
+        self.wait_for(WaitingFor::Low).await;
+        Ok(())
+    }
+
+    #[inline(always)]
+    async fn wait_for_rising_edge(&mut self) -> Result<(), Self::Error> {
+        self.wait_for(WaitingFor::RisingEdge).await;
+        Ok(())
+    }
+
+    #[inline(always)]
+    async fn wait_for_falling_edge(&mut self) -> Result<(), Self::Error> {
+        self.wait_for(WaitingFor::FallingEdge).await;
+        Ok(())
+    }
+
+    #[inline(always)]
+    async fn wait_for_any_edge(&mut self) -> Result<(), Self::Error> {
+        self.wait_for(WaitingFor::AnyEdge).await;
+        Ok(())
+    }
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
+pub enum WaitingFor {
+    High,
+    Low,
+    RisingEdge,
+    FallingEdge,
+    AnyEdge,
 }
 
 pub enum EventPolarity {
@@ -396,12 +403,6 @@ pub enum EventPolarity {
     HiToLo,
     LoToHi,
     Toggle,
-}
-
-pub enum PortEventSense {
-    Disabled,
-    High,
-    Low,
 }
 
 /// Trait to represent event input pin.
@@ -429,30 +430,6 @@ impl GpioteInputPin for Pin<Input<PullDown>> {
 }
 
 impl GpioteInputPin for Pin<Input<Floating>> {
-    fn pin(&self) -> u8 {
-        self.pin()
-    }
-    fn port(&self) -> Port {
-        self.port()
-    }
-}
-
-/// Trait to represent task output pin.
-pub trait GpioteOutputPin {
-    fn pin(&self) -> u8;
-    fn port(&self) -> Port;
-}
-
-impl GpioteOutputPin for Pin<Output<OpenDrain>> {
-    fn pin(&self) -> u8 {
-        self.pin()
-    }
-    fn port(&self) -> Port {
-        self.port()
-    }
-}
-
-impl GpioteOutputPin for Pin<Output<PushPull>> {
     fn pin(&self) -> u8 {
         self.pin()
     }

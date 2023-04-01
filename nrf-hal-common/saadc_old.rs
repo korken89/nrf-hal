@@ -32,62 +32,17 @@ use crate::pac::{saadc_ns as saadc, SAADC_NS as SAADC};
 #[cfg(not(any(feature = "9160", feature = "5340-app")))]
 use crate::pac::{saadc, SAADC};
 
-use crate::{pac::NVIC, waker_registration::CriticalSectionWakerRegistration, InterruptToken};
 use core::{
-    future::poll_fn,
+    hint::unreachable_unchecked,
     sync::atomic::{compiler_fence, Ordering::SeqCst},
-    task::Poll,
 };
+use embedded_hal::adc::{Channel, OneShot};
+
 pub use saadc::{
     ch::config::{GAIN_A as Gain, REFSEL_A as Reference, RESP_A as Resistor, TACQ_A as Time},
     oversample::OVERSAMPLE_A as Oversample,
     resolution::VAL_A as Resolution,
 };
-
-/// TODO: Fix this
-#[macro_export]
-macro_rules! register_saadc_interrupt {
-    ($token_name:ident) => {
-        pub struct $token_name;
-
-        unsafe impl async_nrf52832_hal::InterruptToken<async_nrf52832_hal::saadc::export::SAADC>
-            for $token_name
-        {
-        }
-
-        #[no_mangle]
-        #[allow(non_snake_case)]
-        unsafe extern "C" fn SAADC() {
-            async_nrf52832_hal::saadc::export::on_interrupt_saadc();
-        }
-    };
-}
-
-// Hidden export only for use by the macro
-#[doc(hidden)]
-pub mod export {
-    pub use crate::pac::SAADC;
-
-    /// This happens on interrupt.
-    pub fn on_interrupt_saadc() {
-        let saadc = unsafe { &*SAADC::ptr() };
-
-        // Calibration done event
-        if saadc.events_calibratedone.read().bits() != 0 {
-            saadc.intenclr.write(|w| w.calibratedone().set_bit());
-        }
-
-        // Read end
-        if saadc.events_end.read().bits() != 0 {
-            saadc.intenclr.write(|w| w.end().set_bit());
-        }
-
-        super::WAKER_REGISTRATION.wake();
-    }
-}
-
-static WAKER_REGISTRATION: CriticalSectionWakerRegistration =
-    CriticalSectionWakerRegistration::new();
 
 // Only 1 channel is allowed right now, a discussion needs to be had as to how
 // multiple channels should work (See "scan mode" in the datasheet).
@@ -100,11 +55,7 @@ static WAKER_REGISTRATION: CriticalSectionWakerRegistration =
 pub struct Saadc(SAADC);
 
 impl Saadc {
-    pub fn new(
-        saadc: SAADC,
-        config: SaadcConfig,
-        _saadc_interrupt_token: impl InterruptToken<SAADC>,
-    ) -> Self {
+    pub fn new(saadc: SAADC, config: SaadcConfig) -> Self {
         // The write enums do not implement clone/copy/debug, only the
         // read ones, hence the need to pull out and move the values.
         let SaadcConfig {
@@ -122,6 +73,7 @@ impl Saadc {
             .oversample
             .write(|w| w.oversample().variant(oversample));
         saadc.samplerate.write(|w| w.mode().task());
+
         saadc.ch[0].config.write(|w| {
             w.refsel().variant(reference);
             w.gain().variant(gain);
@@ -134,9 +86,10 @@ impl Saadc {
         });
         saadc.ch[0].pseln.write(|w| w.pseln().nc());
 
-        saadc.intenclr.write(|w| unsafe { w.bits(0xffffffff) });
-        unsafe { NVIC::unmask(crate::pac::Interrupt::SAADC) };
-        saadc.enable.write(|w| w.enable().disabled());
+        // Calibrate
+        saadc.events_calibratedone.reset();
+        saadc.tasks_calibrateoffset.write(|w| unsafe { w.bits(1) });
+        while saadc.events_calibratedone.read().bits() == 0 {}
 
         Saadc(saadc)
     }
@@ -145,108 +98,6 @@ impl Saadc {
     pub fn free(self) -> SAADC {
         self.0.enable.write(|w| w.enable().disabled());
         self.0
-    }
-
-    /// Calibrate the ADC, the datasheet says this should be run every now and again
-    pub async fn calibrate(&mut self) {
-        self.0.enable.write(|w| w.enable().enabled());
-
-        self.0.events_calibratedone.reset();
-        self.0.intenset.write(|w| w.calibratedone().set());
-
-        compiler_fence(SeqCst);
-
-        self.0.tasks_calibrateoffset.write(|w| unsafe { w.bits(1) });
-
-        poll_fn(|cx| {
-            WAKER_REGISTRATION.register(cx.waker());
-
-            if self.0.events_calibratedone.read().bits() != 0 {
-                self.0.events_calibratedone.reset();
-                return Poll::Ready(());
-            }
-
-            Poll::Pending
-        })
-        .await;
-
-        // To fix errata
-        self.0.tasks_stop.write(|w| unsafe { w.bits(1) });
-        while self.0.events_stopped.read().bits() == 0 {}
-        self.0.events_stopped.reset();
-
-        self.0.enable.write(|w| w.enable().disabled());
-    }
-
-    /// Read an ADC pin
-    pub async fn read<PIN, const CHANNEL: u8>(&mut self, _pin: &mut PIN) -> i16
-    where
-        PIN: Channel<Saadc, CHANNEL>,
-    {
-        self.0.enable.write(|w| w.enable().enabled());
-
-        // 2. Read pin
-        match PIN::CHANNEL {
-            0 => self.0.ch[0].pselp.write(|w| w.pselp().analog_input0()),
-            1 => self.0.ch[0].pselp.write(|w| w.pselp().analog_input1()),
-            2 => self.0.ch[0].pselp.write(|w| w.pselp().analog_input2()),
-            3 => self.0.ch[0].pselp.write(|w| w.pselp().analog_input3()),
-            4 => self.0.ch[0].pselp.write(|w| w.pselp().analog_input4()),
-            5 => self.0.ch[0].pselp.write(|w| w.pselp().analog_input5()),
-            6 => self.0.ch[0].pselp.write(|w| w.pselp().analog_input6()),
-            7 => self.0.ch[0].pselp.write(|w| w.pselp().analog_input7()),
-            #[cfg(not(feature = "9160"))]
-            8 => self.0.ch[0].pselp.write(|w| w.pselp().vdd()),
-            #[cfg(any(feature = "52833", feature = "52840"))]
-            13 => self.0.ch[0].pselp.write(|w| w.pselp().vddhdiv5()),
-            _ => {}
-        }
-
-        let mut val: i16 = 0;
-        self.0
-            .result
-            .ptr
-            .write(|w| unsafe { w.ptr().bits(((&mut val) as *mut _) as u32) });
-        self.0
-            .result
-            .maxcnt
-            .write(|w| unsafe { w.maxcnt().bits(1) });
-
-        // Enable interrupt for end
-        self.0.events_end.reset();
-        self.0.intenset.write(|w| w.end().set());
-
-        // Conservative compiler fence to prevent starting the ADC before the
-        // pointer and maxcount have been set.
-        compiler_fence(SeqCst);
-
-        self.0.tasks_start.write(|w| unsafe { w.bits(1) });
-        self.0.tasks_sample.write(|w| unsafe { w.bits(1) });
-
-        poll_fn(|cx| {
-            WAKER_REGISTRATION.register(cx.waker());
-
-            if self.0.events_end.read().bits() != 0 {
-                self.0.events_end.reset();
-                return Poll::Ready(());
-            }
-
-            Poll::Pending
-        })
-        .await;
-
-        // Will only occur if more than one channel has been enabled.
-        // if self.0.result.amount.read().bits() != 1 {
-        //     return Err(nb::Error::Other(()));
-        // }
-
-        // Second fence to prevent optimizations creating issues with the EasyDMA-modified `val`.
-        compiler_fence(SeqCst);
-
-        // Disable ADC after done.
-        self.0.enable.write(|w| w.enable().disabled());
-
-        val
     }
 }
 
@@ -314,14 +165,74 @@ impl Default for SaadcConfig {
     }
 }
 
-pub trait Channel<ADC, const CHANNEL: u8> {
-    const CHANNEL: u8 = CHANNEL;
+impl<PIN> OneShot<Saadc, i16, PIN> for Saadc
+where
+    PIN: Channel<Saadc, ID = u8>,
+{
+    type Error = ();
+
+    /// Sample channel `PIN` for the configured ADC acquisition time in differential input mode.
+    /// Note that this is a blocking operation.
+    fn read(&mut self, _pin: &mut PIN) -> nb::Result<i16, Self::Error> {
+        match PIN::channel() {
+            0 => self.0.ch[0].pselp.write(|w| w.pselp().analog_input0()),
+            1 => self.0.ch[0].pselp.write(|w| w.pselp().analog_input1()),
+            2 => self.0.ch[0].pselp.write(|w| w.pselp().analog_input2()),
+            3 => self.0.ch[0].pselp.write(|w| w.pselp().analog_input3()),
+            4 => self.0.ch[0].pselp.write(|w| w.pselp().analog_input4()),
+            5 => self.0.ch[0].pselp.write(|w| w.pselp().analog_input5()),
+            6 => self.0.ch[0].pselp.write(|w| w.pselp().analog_input6()),
+            7 => self.0.ch[0].pselp.write(|w| w.pselp().analog_input7()),
+            #[cfg(not(feature = "9160"))]
+            8 => self.0.ch[0].pselp.write(|w| w.pselp().vdd()),
+            #[cfg(any(feature = "52833", feature = "52840"))]
+            13 => self.0.ch[0].pselp.write(|w| w.pselp().vddhdiv5()),
+            // This can never happen the only analog pins have already been defined
+            // PAY CLOSE ATTENTION TO ANY CHANGES TO THIS IMPL OR THE `channel_mappings!` MACRO
+            _ => unsafe { unreachable_unchecked() },
+        }
+
+        let mut val: i16 = 0;
+        self.0
+            .result
+            .ptr
+            .write(|w| unsafe { w.ptr().bits(((&mut val) as *mut _) as u32) });
+        self.0
+            .result
+            .maxcnt
+            .write(|w| unsafe { w.maxcnt().bits(1) });
+
+        // Conservative compiler fence to prevent starting the ADC before the
+        // pointer and maxcount have been set.
+        compiler_fence(SeqCst);
+
+        self.0.tasks_start.write(|w| unsafe { w.bits(1) });
+        self.0.tasks_sample.write(|w| unsafe { w.bits(1) });
+
+        while self.0.events_end.read().bits() == 0 {}
+        self.0.events_end.reset();
+
+        // Will only occur if more than one channel has been enabled.
+        if self.0.result.amount.read().bits() != 1 {
+            return Err(nb::Error::Other(()));
+        }
+
+        // Second fence to prevent optimizations creating issues with the EasyDMA-modified `val`.
+        compiler_fence(SeqCst);
+
+        Ok(val)
+    }
 }
 
 macro_rules! channel_mappings {
     ( $($n:expr => $pin:ident,)*) => {
         $(
-            impl<STATE> Channel<Saadc, $n> for crate::gpio::p0::$pin<STATE> {
+            impl<STATE> Channel<Saadc> for crate::gpio::p0::$pin<STATE> {
+                type ID = u8;
+
+                fn channel() -> <Self as embedded_hal::adc::Channel<Saadc>>::ID {
+                    $n
+                }
             }
         )*
     };
@@ -352,14 +263,26 @@ channel_mappings! {
 }
 
 #[cfg(not(feature = "9160"))]
-impl Channel<Saadc, 8> for InternalVdd {}
+impl Channel<Saadc> for InternalVdd {
+    type ID = u8;
+
+    fn channel() -> <Self as embedded_hal::adc::Channel<Saadc>>::ID {
+        8
+    }
+}
 
 #[cfg(not(feature = "9160"))]
 /// Channel that doesn't sample a pin, but the internal VDD voltage.
 pub struct InternalVdd;
 
 #[cfg(any(feature = "52833", feature = "52840"))]
-impl Channel<Saadc, 13> for InternalVddHdiv5 {}
+impl Channel<Saadc> for InternalVddHdiv5 {
+    type ID = u8;
+
+    fn channel() -> <Self as embedded_hal::adc::Channel<Saadc>>::ID {
+        13
+    }
+}
 
 #[cfg(any(feature = "52833", feature = "52840"))]
 /// The voltage on the VDDH pin, divided by 5.

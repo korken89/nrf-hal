@@ -3,6 +3,8 @@
 
 #![doc(html_root_url = "https://docs.rs/nrf-hal-common/0.16.0")]
 #![no_std]
+#![feature(async_fn_in_trait)]
+#![allow(incomplete_features)]
 
 use embedded_hal as hal;
 
@@ -45,8 +47,8 @@ pub mod clocks;
     feature = "5340-net"
 )))]
 pub mod comp;
-#[cfg(not(feature = "51"))]
-pub mod delay;
+// #[cfg(not(feature = "51"))]
+// pub mod delay;
 #[cfg(not(any(feature = "9160", feature = "5340-app")))]
 pub mod ecb;
 pub mod gpio;
@@ -59,8 +61,8 @@ pub mod gpiote;
     feature = "5340-net"
 )))]
 pub mod i2s;
-#[cfg(any(feature = "52833", feature = "52840"))]
-pub mod ieee802154;
+// #[cfg(any(feature = "52833", feature = "52840"))]
+// pub mod ieee802154;
 #[cfg(not(any(
     feature = "52811",
     feature = "52810",
@@ -73,8 +75,8 @@ pub mod lpcomp;
 pub mod nvmc;
 #[cfg(not(any(feature = "9160", feature = "5340-app", feature = "5340-net")))]
 pub mod ppi;
-#[cfg(not(any(feature = "51", feature = "5340-net")))]
-pub mod pwm;
+// #[cfg(not(any(feature = "51", feature = "5340-net")))]
+// pub mod pwm;
 #[cfg(not(any(
     feature = "51",
     feature = "9160",
@@ -87,35 +89,36 @@ pub mod rng;
 pub mod rtc;
 #[cfg(not(any(feature = "51", feature = "5340-net")))]
 pub mod saadc;
-#[cfg(not(any(feature = "9160", feature = "5340-app", feature = "5340-net")))]
-pub mod spi;
+// #[cfg(not(any(feature = "9160", feature = "5340-app", feature = "5340-net")))]
+// pub mod spi;
 #[cfg(not(feature = "51"))]
 pub mod spim;
-#[cfg(not(feature = "51"))]
-pub mod spis;
+// #[cfg(not(feature = "51"))]
+// pub mod spis;
 #[cfg(not(any(feature = "9160", feature = "5340-app")))]
 pub mod temp;
 pub mod time;
-pub mod timer;
-#[cfg(feature = "51")]
-pub mod twi;
-#[cfg(not(feature = "51"))]
-pub mod twim;
-#[cfg(not(feature = "51"))]
-pub mod twis;
-#[cfg(feature = "51")]
-pub mod uart;
-#[cfg(not(feature = "51"))]
-pub mod uarte;
+// pub mod timer;
+// #[cfg(feature = "51")]
+// pub mod twi;
+// #[cfg(not(feature = "51"))]
+// pub mod twim;
+// #[cfg(not(feature = "51"))]
+// pub mod twis;
+// #[cfg(feature = "51")]
+// pub mod uart;
+// #[cfg(not(feature = "51"))]
+// pub mod uarte;
 #[cfg(not(any(feature = "9160", feature = "5340-app", feature = "5340-net")))]
 pub mod uicr;
 #[cfg(feature = "nrf-usbd")]
 pub mod usbd;
+mod waker_registration;
 pub mod wdt;
 
 pub mod prelude {
-    pub use crate::hal::digital::v2::*;
-    pub use crate::hal::prelude::*;
+    // pub use crate::hal::digital::v2::*;
+    // pub use crate::hal::prelude::*;
 
     #[cfg(not(any(feature = "9160", feature = "5340-app", feature = "5340-net")))]
     pub use crate::ppi::{ConfigurablePpi, Ppi};
@@ -194,32 +197,70 @@ impl DmaSlice {
             len: slice.len() as u32,
         }
     }
+
+    pub fn in_ram(&self) -> bool {
+        let ptr = self.ptr as usize;
+        let len = self.len as usize;
+        ptr >= target_constants::SRAM_LOWER && (ptr + len) < target_constants::SRAM_UPPER
+    }
+
+    pub fn len(&self) -> usize {
+        self.len as usize
+    }
+}
+
+struct OnDrop<F: FnOnce()> {
+    f: core::mem::MaybeUninit<F>,
+}
+
+impl<F: FnOnce()> OnDrop<F> {
+    pub fn new(f: F) -> Self {
+        Self {
+            f: core::mem::MaybeUninit::new(f),
+        }
+    }
+
+    pub fn defuse(self) {
+        core::mem::forget(self)
+    }
+}
+
+impl<F: FnOnce()> Drop for OnDrop<F> {
+    fn drop(&mut self) {
+        unsafe { self.f.as_ptr().read()() }
+    }
 }
 
 pub use crate::clocks::Clocks;
-#[cfg(not(feature = "51"))]
-pub use crate::delay::Delay;
+// #[cfg(not(feature = "51"))]
+// pub use crate::delay::Delay;
 #[cfg(not(any(feature = "9160", feature = "5340-app")))]
 pub use crate::rng::Rng;
 pub use crate::rtc::Rtc;
-pub use crate::timer::Timer;
+// pub use crate::timer::Timer;
 
-#[cfg(feature = "51")]
-pub use crate::adc::Adc;
+// #[cfg(feature = "51")]
+// pub use crate::adc::Adc;
 #[cfg(not(any(feature = "51", feature = "5340-net")))]
 pub use crate::saadc::Saadc;
 
-#[cfg(feature = "51")]
-pub use crate::spi::Spi;
+// #[cfg(feature = "51")]
+// pub use crate::spi::Spi;
 #[cfg(not(feature = "51"))]
 pub use crate::spim::Spim;
 
-#[cfg(feature = "51")]
-pub use crate::twi::Twi;
-#[cfg(not(feature = "51"))]
-pub use crate::twim::Twim;
+// #[cfg(feature = "51")]
+// pub use crate::twi::Twi;
+// #[cfg(not(feature = "51"))]
+// pub use crate::twim::Twim;
 
-#[cfg(feature = "51")]
-pub use crate::uart::Uart;
-#[cfg(not(feature = "51"))]
-pub use crate::uarte::Uarte;
+// #[cfg(feature = "51")]
+// pub use crate::uart::Uart;
+// #[cfg(not(feature = "51"))]
+// pub use crate::uarte::Uarte;
+
+/// This marker is implemented on an interupt token to enforce that the right tokens
+/// are given to the correct HAL peripheral.
+///
+/// This trait is implemented by the HAL, not intended for user implementation.
+pub unsafe trait InterruptToken<Periperhal> {}

@@ -85,7 +85,7 @@ use crate::pac::P1;
 #[cfg(feature = "5340-net")]
 use crate::pac::P1_NS as P1;
 
-use embedded_hal::digital::{ErrorType, InputPin, OutputPin, StatefulOutputPin};
+use crate::hal::digital::v2::{InputPin, OutputPin, StatefulOutputPin};
 use void::Void;
 
 impl<MODE> Pin<MODE> {
@@ -112,12 +112,55 @@ impl<MODE> Pin<MODE> {
 
     #[inline]
     pub fn pin(&self) -> u8 {
-        self.pin_port
+        #[cfg(any(
+            feature = "52833",
+            feature = "52840",
+            feature = "5340-app",
+            feature = "5340-net"
+        ))]
+        {
+            self.pin_port & 0x1f
+        }
+
+        #[cfg(not(any(
+            feature = "52833",
+            feature = "52840",
+            feature = "5340-app",
+            feature = "5340-net"
+        )))]
+        {
+            self.pin_port
+        }
     }
 
     #[inline]
     pub fn port(&self) -> Port {
-        Port::Port0
+        #[cfg(any(feature = "52833", feature = "52840", feature = "5340-net"))]
+        {
+            if self.pin_port & 0x20 == 0 {
+                Port::Port0
+            } else {
+                Port::Port1
+            }
+        }
+
+        #[cfg(any(feature = "5340-app"))]
+        {
+            if self.pin_port & 0x20 == 0 {
+                Port::Port0
+            } else {
+                Port::Port0Secure
+            }
+        }
+        #[cfg(not(any(
+            feature = "52833",
+            feature = "52840",
+            feature = "5340-app",
+            feature = "5340-net"
+        )))]
+        {
+            Port::Port0
+        }
     }
 
     #[inline]
@@ -293,11 +336,9 @@ impl<MODE> Pin<MODE> {
     }
 }
 
-impl<MODE> ErrorType for Pin<MODE> {
-    type Error = Void;
-}
-
 impl<MODE> InputPin for Pin<Input<MODE>> {
+    type Error = Void;
+
     fn is_high(&self) -> Result<bool, Self::Error> {
         self.is_low().map(|v| !v)
     }
@@ -308,6 +349,8 @@ impl<MODE> InputPin for Pin<Input<MODE>> {
 }
 
 impl InputPin for Pin<Output<OpenDrainIO>> {
+    type Error = Void;
+
     fn is_high(&self) -> Result<bool, Self::Error> {
         self.is_low().map(|v| !v)
     }
@@ -318,6 +361,8 @@ impl InputPin for Pin<Output<OpenDrainIO>> {
 }
 
 impl<MODE> OutputPin for Pin<Output<MODE>> {
+    type Error = Void;
+
     /// Set the output as high.
     fn set_high(&mut self) -> Result<(), Self::Error> {
         // NOTE(unsafe) atomic write to a stateless register - TODO(AJM) verify?
@@ -361,6 +406,18 @@ pub enum OpenDrainConfig {
     HighDrive0Disconnect1,
 }
 
+#[cfg(feature = "51")]
+use crate::pac::gpio::pin_cnf;
+
+#[cfg(any(feature = "5340-app", feature = "5340-net", feature = "9160"))]
+use crate::pac::p0_ns::pin_cnf;
+
+#[cfg(not(any(
+    feature = "9160",
+    feature = "5340-app",
+    feature = "5340-net",
+    feature = "51"
+)))]
 use crate::pac::p0::pin_cnf;
 
 impl OpenDrainConfig {
@@ -404,7 +461,7 @@ macro_rules! gpio {
                 $PX
             };
 
-            use embedded_hal::digital::{ErrorType, OutputPin, StatefulOutputPin, InputPin};
+            use crate::hal::digital::v2::{OutputPin, StatefulOutputPin, InputPin};
             use void::Void;
 
 
@@ -605,11 +662,9 @@ macro_rules! gpio {
                     }
                 }
 
-                impl<MODE> ErrorType for $PXi<MODE> {
-                    type Error = Void;
-                }
-
                 impl<MODE> InputPin for $PXi<Input<MODE>> {
+                    type Error = Void;
+
                     fn is_high(&self) -> Result<bool, Self::Error> {
                         self.is_low().map(|v| !v)
                     }
@@ -620,6 +675,8 @@ macro_rules! gpio {
                 }
 
                 impl InputPin for $PXi<Output<OpenDrainIO>> {
+                    type Error = Void;
+
                     fn is_high(&self) -> Result<bool, Self::Error> {
                         self.is_low().map(|v| !v)
                     }
@@ -636,6 +693,8 @@ macro_rules! gpio {
                 }
 
                 impl<MODE> OutputPin for $PXi<Output<MODE>> {
+                    type Error = Void;
+
                     /// Set the output as high
                     fn set_high(&mut self) -> Result<(), Self::Error> {
                         // NOTE(unsafe) atomic write to a stateless register - TODO(AJM) verify?

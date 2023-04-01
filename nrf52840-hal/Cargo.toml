@@ -19,16 +19,13 @@ edition = "2018"
 
 [dependencies]
 nrf52840-pac = "0.12.2"
+embedded-hal = "=1.0.0-alpha.9"
 
 [dependencies.nrf-hal-common]
 path = "../nrf-hal-common"
 default-features = false
 features = ["52840"]
 version = "=0.16.0"
-
-[dependencies.embedded-hal]
-features = ["unproven"]
-version = "0.2.3"
 
 [features]
 doc = []

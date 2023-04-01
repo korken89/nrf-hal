@@ -20,13 +20,16 @@ license = "MIT OR Apache-2.0"
 edition = "2018"
 
 [dependencies]
-cortex-m = "0.7.3"
+cortex-m = "0.7.7"
+critical-section = "1.1.1"
 nb = "1.0.0"
 fixed = "1.0.0"
 rand_core = "0.6.3"
 cfg-if = "1.0.0"
 embedded-dma = "0.2.0"
 embedded-storage = "0.3.0"
+embedded-hal-async = "0.2.0-alpha.0"
+embedded-hal = "=1.0.0-alpha.9"
 
 [dependencies.void]
 default-features = false
@@ -75,10 +78,6 @@ version = "0.12.2"
 [dependencies.nrf-usbd]
 version = "0.2.0"
 optional = true
-
-[dependencies.embedded-hal]
-features = ["unproven"]
-version = "0.2.4"
 
 [features]
 doc = []

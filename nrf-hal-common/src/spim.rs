@@ -31,7 +31,143 @@ use crate::pac::SPIM3;
 use crate::gpio::{Floating, Input, Output, Pin, PushPull};
 use crate::target_constants::{EASY_DMA_SIZE, FORCE_COPY_BUFFER_SIZE};
 use crate::{slice_in_ram, slice_in_ram_or, DmaSlice};
-use embedded_hal::digital::v2::OutputPin;
+
+use crate::waker_registration::CriticalSectionWakerRegistration;
+use crate::InterruptToken;
+use core::sync::atomic::Ordering;
+use core::task::{Poll, Waker};
+
+/// SPIM events
+#[derive(Debug, Eq, PartialEq, Clone, Copy)]
+pub enum SpimEvent {
+    End,
+    EndRx,
+    EndTx,
+    Stopped,
+    Started,
+}
+
+#[macro_export]
+macro_rules! register_spim0_interrupt {
+    ($token_name:ident) => {
+        pub struct $token_name;
+
+        unsafe impl async_nrf52832_hal::InterruptToken<async_nrf52832_hal::spim::export::SPIM0>
+            for $token_name
+        {
+        }
+
+        #[no_mangle]
+        #[allow(non_snake_case)]
+        unsafe extern "C" fn SPIM0_SPIS0_TWIM0_TWIS0_SPI0_TWI0() {
+            async_nrf52832_hal::spim::export::on_interrupt_spim0();
+        }
+    };
+}
+
+#[macro_export]
+macro_rules! register_spim1_interrupt {
+    ($token_name:ident) => {
+        pub struct $token_name;
+
+        unsafe impl async_nrf52832_hal::InterruptToken<async_nrf52832_hal::spim::export::SPIM1>
+            for $token_name
+        {
+        }
+
+        #[no_mangle]
+        #[allow(non_snake_case)]
+        unsafe extern "C" fn SPIM1_SPIS1_TWIM1_TWIS1_SPI1_TWI1() {
+            async_nrf52832_hal::spim::export::on_interrupt_spim1();
+        }
+    };
+}
+
+#[macro_export]
+macro_rules! register_spim2_interrupt {
+    ($token_name:ident) => {
+        pub struct $token_name;
+
+        unsafe impl async_nrf52832_hal::InterruptToken<async_nrf52832_hal::spim::export::SPIM2>
+            for $token_name
+        {
+        }
+
+        #[no_mangle]
+        #[allow(non_snake_case)]
+        unsafe extern "C" fn SPIM2_SPIS2_SPI2() {
+            async_nrf52832_hal::spim::export::on_interrupt_spim2();
+        }
+    };
+}
+
+#[macro_export]
+macro_rules! register_spim3_interrupt {
+    ($token_name:ident) => {
+        pub struct $token_name;
+
+        unsafe impl async_nrf52832_hal::InterruptToken<async_nrf52832_hal::spim::export::SPIM3>
+            for $token_name
+        {
+        }
+
+        #[no_mangle]
+        #[allow(non_snake_case)]
+        unsafe extern "C" fn SPIM3() {
+            async_nrf52832_hal::spim::export::on_interrupt_spim3();
+        }
+    };
+}
+
+static SPIM0_WAKER: CriticalSectionWakerRegistration = CriticalSectionWakerRegistration::new();
+static SPIM1_WAKER: CriticalSectionWakerRegistration = CriticalSectionWakerRegistration::new();
+static SPIM2_WAKER: CriticalSectionWakerRegistration = CriticalSectionWakerRegistration::new();
+
+// Hidden export only for use by the macro
+#[doc(hidden)]
+pub mod export {
+    #[cfg(not(any(feature = "9160", feature = "5340-app", feature = "5340-net")))]
+    use crate::pac::SPIM0;
+
+    #[cfg(feature = "52811")]
+    use crate::pac::SPIM1;
+
+    #[cfg(any(feature = "52832", feature = "52833", feature = "52840"))]
+    use crate::pac::{SPIM1, SPIM2};
+
+    #[cfg(any(feature = "52833", feature = "52840"))]
+    use crate::pac::SPIM3;
+
+    /// On interrupt.
+    pub fn on_interrupt_spim0() {
+        let spim = unsafe { &*SPIM0::PTR };
+
+        if spim.events_end.read().bits() != 0 {
+            super::SPIM0_WAKER.wake();
+            spim.intenclr.write(|w| w.end().clear());
+        }
+    }
+
+    /// On interrupt.
+    pub fn on_interrupt_spim1() {
+        let spim = unsafe { &*SPIM1::PTR };
+
+        if spim.events_end.read().bits() != 0 {
+            super::SPIM1_WAKER.wake();
+            spim.intenclr.write(|w| w.end().clear());
+        }
+    }
+
+    /// On interrupt.
+    pub fn on_interrupt_spim2() {
+        let spim = unsafe { &*SPIM2::PTR };
+
+        if spim.events_end.read().bits() != 0 {
+            super::SPIM2_WAKER.wake();
+            spim.intenclr.write(|w| w.end().clear());
+        }
+    }
+}
 
 /// Interface to a SPIM instance.
 ///
@@ -39,76 +175,171 @@ use embedded_hal::digital::v2::OutputPin;
 /// - The SPIM instances share the same address space with instances of SPIS,
 ///   SPI, TWIM, TWIS, and TWI. You need to make sure that conflicting instances
 ///   are disabled before using `Spim`. See product specification, section 15.2.
-pub struct Spim<T>(T);
+pub struct Spim<T>(T)
+where
+    T: Instance;
 
-impl<T> embedded_hal::blocking::spi::Transfer<u8> for Spim<T>
+impl embedded_hal::spi::Error for Error {
+    fn kind(&self) -> embedded_hal::spi::ErrorKind {
+        embedded_hal::spi::ErrorKind::Other
+    }
+}
+
+impl<T> embedded_hal::spi::ErrorType for Spim<T>
 where
     T: Instance,
 {
     type Error = Error;
+}
 
-    fn transfer<'w>(&mut self, words: &'w mut [u8]) -> Result<&'w [u8], Error> {
-        // If the slice isn't in RAM, we can't write back to it at all
+impl<T> embedded_hal::spi::SpiBus for Spim<T>
+where
+    T: Instance,
+{
+    fn transfer(&mut self, read: &mut [u8], write: &[u8]) -> Result<(), Self::Error> {
+        slice_in_ram_or(write, Error::DMABufferNotInDataMemory)?;
+
+        let txi = write
+            .chunks(EASY_DMA_SIZE)
+            .map(Some)
+            .chain(repeat_with(|| None));
+
+        let rxi = read
+            .chunks_mut(EASY_DMA_SIZE)
+            .map(Some)
+            .chain(repeat_with(|| None));
+
+        let res = txi
+            .zip(rxi)
+            .take_while(|(t, r)| t.is_some() || r.is_some())
+            // We also turn the slices into either a DmaSlice (if there was data), or a null
+            // DmaSlice (if there is no data).
+            .map(|(t, r)| {
+                (
+                    t.map(|t| DmaSlice::from_slice(t))
+                        .unwrap_or_else(DmaSlice::null),
+                    r.map(|r| DmaSlice::from_slice(r))
+                        .unwrap_or_else(DmaSlice::null),
+                )
+            })
+            .try_for_each(|(t, r)| self.do_spi_dma_transfer(t, r));
+
+        res
+    }
+
+    fn transfer_in_place(&mut self, words: &mut [u8]) -> Result<(), Self::Error> {
         slice_in_ram_or(words, Error::DMABufferNotInDataMemory)?;
 
         words.chunks(EASY_DMA_SIZE).try_for_each(|chunk| {
             self.do_spi_dma_transfer(DmaSlice::from_slice(chunk), DmaSlice::from_slice(chunk))
         })?;
 
-        Ok(words)
+        Ok(())
     }
 }
 
-impl<T> embedded_hal::blocking::spi::Write<u8> for Spim<T>
+impl<T> embedded_hal::spi::SpiBusWrite for Spim<T>
 where
     T: Instance,
 {
-    type Error = Error;
+    fn write(&mut self, words: &[u8]) -> Result<(), Self::Error> {
+        slice_in_ram_or(words, Error::DMABufferNotInDataMemory)?;
 
-    fn write<'w>(&mut self, words: &'w [u8]) -> Result<(), Error> {
-        // Mask on segment where Data RAM is located on nrf52840 and nrf52832
-        // Upper limit is choosen to entire area where DataRam can be placed
-        let needs_copy = !slice_in_ram(words);
+        words.chunks(EASY_DMA_SIZE).try_for_each(|chunk| {
+            self.do_spi_dma_transfer(DmaSlice::from_slice(chunk), DmaSlice::null())
+        })?;
 
-        let chunk_sz = if needs_copy {
-            FORCE_COPY_BUFFER_SIZE
-        } else {
-            EASY_DMA_SIZE
-        };
-
-        let step = if needs_copy {
-            Self::spi_dma_copy
-        } else {
-            Self::spi_dma_no_copy
-        };
-
-        words.chunks(chunk_sz).try_for_each(|c| step(self, c))
+        Ok(())
     }
 }
+
+impl<T> embedded_hal::spi::SpiBusRead for Spim<T>
+where
+    T: Instance,
+{
+    fn read(&mut self, words: &mut [u8]) -> Result<(), Self::Error> {
+        embedded_hal::spi::SpiBus::transfer_in_place(self, words)
+    }
+}
+
+impl<T> embedded_hal::spi::SpiBusFlush for Spim<T>
+where
+    T: Instance,
+{
+    fn flush(&mut self) -> Result<(), Self::Error> {
+        // Noop
+        Ok(())
+    }
+}
+
 impl<T> Spim<T>
 where
     T: Instance,
 {
-    fn spi_dma_no_copy(&mut self, chunk: &[u8]) -> Result<(), Error> {
-        self.do_spi_dma_transfer(DmaSlice::from_slice(chunk), DmaSlice::null())
+    /// Enables interrupt for specified event.
+    #[inline(always)]
+    pub fn enable_interrupt(&self, event: SpimEvent) -> &Self {
+        self.0.intenset.modify(|_r, w| match event {
+            SpimEvent::End => w.end().set_bit(),
+            SpimEvent::EndRx => w.endrx().set_bit(),
+            SpimEvent::EndTx => w.endtx().set_bit(),
+            SpimEvent::Stopped => w.stopped().set_bit(),
+            SpimEvent::Started => w.started().set_bit(),
+        });
+        self
     }
 
-    fn spi_dma_copy(&mut self, chunk: &[u8]) -> Result<(), Error> {
-        let mut buf = [0u8; FORCE_COPY_BUFFER_SIZE];
-        buf[..chunk.len()].copy_from_slice(chunk);
-
-        self.do_spi_dma_transfer(DmaSlice::from_slice(&buf[..chunk.len()]), DmaSlice::null())
+    /// Disables interrupt for specified event.
+    #[inline(always)]
+    pub fn disable_interrupt(&self, event: SpimEvent) -> &Self {
+        self.0.intenclr.write(|w| match event {
+            SpimEvent::End => w.end().set_bit(),
+            SpimEvent::EndRx => w.endrx().set_bit(),
+            SpimEvent::EndTx => w.endtx().set_bit(),
+            SpimEvent::Stopped => w.stopped().set_bit(),
+            SpimEvent::Started => w.started().set_bit(),
+        });
+        self
     }
 
-    pub fn new(spim: T, pins: Pins, frequency: Frequency, mode: Mode, orc: u8) -> Self {
-        // Select pins.
-        match pins.sck {
-            Some(sck) => spim.psel.sck.write(|w| {
-                unsafe { w.bits(sck.psel_bits()) };
-                w.connect().connected()
-            }),
-            None => spim.psel.sck.write(|w| w.connect().disconnected()),
+    /// Resets specified event.
+    #[inline(always)]
+    pub fn reset_event(&self, event: SpimEvent) {
+        match event {
+            SpimEvent::End => self.0.events_end.reset(),
+            SpimEvent::EndRx => self.0.events_endrx.reset(),
+            SpimEvent::EndTx => self.0.events_endtx.reset(),
+            SpimEvent::Stopped => self.0.events_stopped.reset(),
+            SpimEvent::Started => self.0.events_started.reset(),
+        };
+    }
+
+    /// Checks if specified event has been triggered.
+    #[inline(always)]
+    pub fn is_event_triggered(&self, event: SpimEvent) -> bool {
+        match event {
+            SpimEvent::End => self.0.events_end.read().bits() != 0,
+            SpimEvent::EndRx => self.0.events_endrx.read().bits() != 0,
+            SpimEvent::EndTx => self.0.events_endtx.read().bits() != 0,
+            SpimEvent::Stopped => self.0.events_stopped.read().bits() != 0,
+            SpimEvent::Started => self.0.events_started.read().bits() != 0,
         }
+    }
+
+    pub fn new(
+        spim: T,
+        pins: Pins,
+        frequency: Frequency,
+        mode: Mode,
+        orc: u8,
+        _interrupt_token: impl InterruptToken<T>,
+    ) -> Self {
+        // Select pins.
+        spim.psel.sck.write(|w| {
+            unsafe { w.bits(pins.sck.psel_bits()) };
+            w.connect().connected()
+        });
+
         match pins.mosi {
             Some(mosi) => spim.psel.mosi.write(|w| {
                 unsafe { w.bits(mosi.psel_bits()) };
@@ -159,15 +390,16 @@ where
             // there.
             unsafe { w.orc().bits(orc) });
 
+        T::unmask_interrupt();
+
         Spim(spim)
     }
 
-    /// Internal helper function to setup and execute SPIM DMA transfer.
-    fn do_spi_dma_transfer(&mut self, tx: DmaSlice, rx: DmaSlice) -> Result<(), Error> {
+    fn start_dma_transfer(&mut self, tx: &DmaSlice, rx: &DmaSlice) {
         // Conservative compiler fence to prevent optimizations that do not
         // take in to account actions by DMA. The fence has been placed here,
         // before any DMA action has started.
-        compiler_fence(SeqCst);
+        compiler_fence(Ordering::SeqCst);
 
         // Set up the DMA write.
         self.0.txd.ptr.write(|w| unsafe { w.ptr().bits(tx.ptr) });
@@ -189,6 +421,10 @@ where
             // safe. Please refer to the explanation there.
             unsafe { w.maxcnt().bits(rx.len as _) });
 
+        // Reset and enable the end event
+        self.reset_done();
+        self.enable_interrupt(SpimEvent::End);
+
         // Start SPI transaction.
         self.0.tasks_start.write(|w|
             // `1` is a valid value to write to task registers.
@@ -197,21 +433,23 @@ where
         // Conservative compiler fence to prevent optimizations that do not
         // take in to account actions by DMA. The fence has been placed here,
         // after all possible DMA actions have completed.
-        compiler_fence(SeqCst);
+        compiler_fence(Ordering::SeqCst);
+    }
+
+    /// Internal helper function to setup and execute SPIM DMA transfer.
+    fn do_spi_dma_transfer(&mut self, tx: DmaSlice, rx: DmaSlice) -> Result<(), Error> {
+        self.start_dma_transfer(&tx, &rx);
 
         // Wait for END event.
         //
         // This event is triggered once both transmitting and receiving are
         // done.
-        while self.0.events_end.read().bits() == 0 {}
-
-        // Reset the event, otherwise it will always read `1` from now on.
-        self.0.events_end.write(|w| w);
+        while !self.is_done() {}
 
         // Conservative compiler fence to prevent optimizations that do not
         // take in to account actions by DMA. The fence has been placed here,
         // after all possible DMA actions have completed.
-        compiler_fence(SeqCst);
+        compiler_fence(Ordering::SeqCst);
 
         if self.0.txd.amount.read().bits() != tx.len {
             return Err(Error::Transmit);
@@ -219,186 +457,176 @@ where
         if self.0.rxd.amount.read().bits() != rx.len {
             return Err(Error::Receive);
         }
+
         Ok(())
     }
 
-    /// Read and write from a SPI slave, using a single buffer.
-    ///
-    /// This method implements a complete read transaction, which consists of
-    /// the master transmitting what it wishes to read, and the slave responding
-    /// with the requested data.
-    ///
-    /// Uses the provided chip select pin to initiate the transaction. Transmits
-    /// all bytes in `buffer`, then receives an equal number of bytes.
-    pub fn transfer(
-        &mut self,
-        chip_select: &mut Pin<Output<PushPull>>,
-        buffer: &mut [u8],
-    ) -> Result<(), Error> {
-        slice_in_ram_or(buffer, Error::DMABufferNotInDataMemory)?;
+    /// Internal helper
+    async fn async_do_spi_dma_transfer(&mut self, tx: DmaSlice, rx: DmaSlice) -> Result<(), Error> {
+        if !rx.in_ram() {
+            return Err(Error::DMABufferNotInDataMemory);
+        }
 
-        chip_select.set_low().unwrap();
+        if tx.len() > EASY_DMA_SIZE {
+            return Err(Error::TxBufferTooLong);
+        }
 
-        // Don't return early, as we must reset the CS pin.
-        let res = buffer.chunks(EASY_DMA_SIZE).try_for_each(|chunk| {
-            self.do_spi_dma_transfer(DmaSlice::from_slice(chunk), DmaSlice::from_slice(chunk))
+        if rx.len() > EASY_DMA_SIZE {
+            return Err(Error::RxBufferTooLong);
+        }
+
+        let dropper = crate::OnDrop::new(|| {
+            Self::stop();
         });
 
-        chip_select.set_high().unwrap();
+        self.start_dma_transfer(&tx, &rx);
 
-        res
+        core::future::poll_fn(|cx| {
+            T::register_waker(cx.waker());
+
+            if self.is_done() {
+                Poll::Ready(())
+            } else {
+                Poll::Pending
+            }
+        })
+        .await;
+
+        dropper.defuse();
+
+        if self.0.txd.amount.read().bits() != tx.len {
+            return Err(Error::Transmit);
+        }
+        if self.0.rxd.amount.read().bits() != rx.len {
+            return Err(Error::Receive);
+        }
+
+        Ok(())
     }
 
-    /// Read and write from a SPI slave, using separate read and write buffers.
-    ///
-    /// This method implements a complete read transaction, which consists of
-    /// the master transmitting what it wishes to read, and the slave responding
-    /// with the requested data.
-    ///
-    /// Uses the provided chip select pin to initiate the transaction. Transmits
-    /// all bytes in `tx_buffer`, then receives bytes until `rx_buffer` is full.
-    ///
-    /// If `tx_buffer.len() != rx_buffer.len()`, the transaction will stop at the
-    /// smaller of either buffer.
-    pub fn transfer_split_even(
-        &mut self,
-        chip_select: &mut Pin<Output<PushPull>>,
-        tx_buffer: &[u8],
-        rx_buffer: &mut [u8],
-    ) -> Result<(), Error> {
-        // NOTE: RAM slice check for `rx_buffer` is not necessary, as a mutable
-        // slice can only be built from data located in RAM.
-        slice_in_ram_or(tx_buffer, Error::DMABufferNotInDataMemory)?;
-
-        let txi = tx_buffer.chunks(EASY_DMA_SIZE);
-        let rxi = rx_buffer.chunks_mut(EASY_DMA_SIZE);
-
-        chip_select.set_low().unwrap();
-
-        // Don't return early, as we must reset the CS pin
-        let res = txi.zip(rxi).try_for_each(|(t, r)| {
-            self.do_spi_dma_transfer(DmaSlice::from_slice(t), DmaSlice::from_slice(r))
-        });
-
-        chip_select.set_high().unwrap();
-
-        res
+    /// SPI transfer, sends and receives data.
+    async fn transfer(&mut self, read: &mut [u8], write: &[u8]) -> Result<(), Error> {
+        if slice_in_ram(write) {
+            self.async_do_spi_dma_transfer(DmaSlice::from_slice(read), DmaSlice::from_slice(write))
+                .await
+        } else {
+            // Copy the buffer to RAM
+            let write_ram_buf = &mut [0; EASY_DMA_SIZE][..write.len()];
+            write_ram_buf.copy_from_slice(write);
+            self.async_do_spi_dma_transfer(
+                DmaSlice::from_slice(read),
+                DmaSlice::from_slice(write_ram_buf),
+            )
+            .await
+        }
     }
 
-    /// Read and write from a SPI slave, using separate read and write buffers.
-    ///
-    /// This method implements a complete read transaction, which consists of
-    /// the master transmitting what it wishes to read, and the slave responding
-    /// with the requested data.
-    ///
-    /// Uses the provided chip select pin to initiate the transaction. Transmits
-    /// all bytes in `tx_buffer`, then receives bytes until `rx_buffer` is full.
-    ///
-    /// This method is more complicated than the other `transfer` methods because
-    /// it is allowed to perform transactions where `tx_buffer.len() != rx_buffer.len()`.
-    /// If this occurs, extra incoming bytes will be discarded, OR extra outgoing bytes
-    /// will be filled with the `orc` value.
-    pub fn transfer_split_uneven(
-        &mut self,
-        chip_select: &mut Pin<Output<PushPull>>,
-        tx_buffer: &[u8],
-        rx_buffer: &mut [u8],
-    ) -> Result<(), Error> {
-        // NOTE: RAM slice check for `rx_buffer` is not necessary, as a mutable
-        // slice can only be built from data located in RAM.
-        slice_in_ram_or(tx_buffer, Error::DMABufferNotInDataMemory)?;
-
-        // For the tx and rx, we want to return Some(chunk)
-        // as long as there is data to send. We then chain a repeat to
-        // the end so once all chunks have been exhausted, we will keep
-        // getting Nones out of the iterators.
-        let txi = tx_buffer
-            .chunks(EASY_DMA_SIZE)
-            .map(Some)
-            .chain(repeat_with(|| None));
-
-        let rxi = rx_buffer
-            .chunks_mut(EASY_DMA_SIZE)
-            .map(Some)
-            .chain(repeat_with(|| None));
-
-        chip_select.set_low().unwrap();
-
-        // We then chain the iterators together, and once BOTH are feeding
-        // back Nones, then we are done sending and receiving.
-        //
-        // Don't return early, as we must reset the CS pin.
-        let res = txi
-            .zip(rxi)
-            .take_while(|(t, r)| t.is_some() || r.is_some())
-            // We also turn the slices into either a DmaSlice (if there was data), or a null
-            // DmaSlice (if there is no data).
-            .map(|(t, r)| {
-                (
-                    t.map(|t| DmaSlice::from_slice(t))
-                        .unwrap_or_else(DmaSlice::null),
-                    r.map(|r| DmaSlice::from_slice(r))
-                        .unwrap_or_else(DmaSlice::null),
-                )
-            })
-            .try_for_each(|(t, r)| self.do_spi_dma_transfer(t, r));
-
-        chip_select.set_high().unwrap();
-
-        res
+    /// Simultaneously sends and receives data. Places the received data into the same buffer.
+    async fn transfer_in_place(&mut self, data: &mut [u8]) -> Result<(), Error> {
+        self.async_do_spi_dma_transfer(DmaSlice::from_slice(data), DmaSlice::from_slice(data))
+            .await
     }
 
-    /// Write to an SPI slave.
-    ///
-    /// This method uses the provided chip select pin to initiate the
-    /// transaction, then transmits all bytes in `tx_buffer`. All incoming
-    /// bytes are discarded.
-    pub fn write(
-        &mut self,
-        chip_select: &mut Pin<Output<PushPull>>,
-        tx_buffer: &[u8],
-    ) -> Result<(), Error> {
-        slice_in_ram_or(tx_buffer, Error::DMABufferNotInDataMemory)?;
-        self.transfer_split_uneven(chip_select, tx_buffer, &mut [0u8; 0])
+    /// Sends data, discarding any received data.
+    async fn write(&mut self, data: &[u8]) -> Result<(), Error> {
+        if slice_in_ram(data) {
+            self.async_do_spi_dma_transfer(DmaSlice::null(), DmaSlice::from_slice(data))
+                .await
+        } else {
+            // Copy the buffer to RAM
+            let write_ram_buf = &mut [0; EASY_DMA_SIZE][..data.len()];
+            write_ram_buf.copy_from_slice(data);
+            self.async_do_spi_dma_transfer(DmaSlice::null(), DmaSlice::from_slice(write_ram_buf))
+                .await
+        }
     }
 
-    /// Return the raw interface to the underlying SPIM peripheral.
-    pub fn free(self) -> (T, Pins) {
-        let sck = self.0.psel.sck.read();
-        let mosi = self.0.psel.mosi.read();
-        let miso = self.0.psel.miso.read();
-        self.0.psel.sck.reset();
-        self.0.psel.mosi.reset();
-        self.0.psel.miso.reset();
-        (
-            self.0,
-            Pins {
-                sck: if sck.connect().is_connected() {
-                    Some(unsafe { Pin::from_psel_bits(sck.bits()) })
-                } else {
-                    None
-                },
-                mosi: if mosi.connect().is_connected() {
-                    Some(unsafe { Pin::from_psel_bits(mosi.bits()) })
-                } else {
-                    None
-                },
-                miso: if miso.connect().is_connected() {
-                    Some(unsafe { Pin::from_psel_bits(miso.bits()) })
-                } else {
-                    None
-                },
-            },
-        )
+    /// Reads data from the SPI bus without sending anything.
+    async fn read(&mut self, data: &mut [u8]) -> Result<(), Error> {
+        self.async_do_spi_dma_transfer(DmaSlice::from_slice(data), DmaSlice::null())
+            .await
+    }
+
+    #[inline(always)]
+    fn is_done(&self) -> bool {
+        self.0.events_end.read().bits() != 0
+    }
+
+    #[inline(always)]
+    fn reset_done(&mut self) {
+        self.0.events_end.write(|w| w);
+    }
+
+    // Stop the SPIM
+    fn stop() {
+        let spim = unsafe { &*T::ptr() };
+        spim.tasks_stop.write(|w| unsafe { w.bits(1) });
+
+        while spim.events_stopped.read().bits() == 0 {}
+
+        spim.events_stopped.write(|w| w);
+    }
+}
+
+impl<T> Drop for Spim<T>
+where
+    T: Instance,
+{
+    fn drop(&mut self) {
+        Self::stop();
+    }
+}
+
+mod async_hal_traits {
+    use super::*;
+
+    use embedded_hal_async::spi::{SpiBus, SpiBusFlush, SpiBusRead, SpiBusWrite};
+
+    impl<T> SpiBusFlush for Spim<T>
+    where
+        T: Instance,
+    {
+        async fn flush(&mut self) -> Result<(), Self::Error> {
+            Ok(())
+        }
+    }
+
+    impl<T> SpiBusRead for Spim<T>
+    where
+        T: Instance,
+    {
+        async fn read(&mut self, words: &mut [u8]) -> Result<(), Self::Error> {
+            self.read(words).await
+        }
+    }
+
+    impl<T> SpiBusWrite for Spim<T>
+    where
+        T: Instance,
+    {
+        async fn write(&mut self, words: &[u8]) -> Result<(), Self::Error> {
+            self.write(words).await
+        }
+    }
+
+    impl<T> SpiBus for Spim<T>
+    where
+        T: Instance,
+    {
+        async fn transfer(&mut self, read: &mut [u8], write: &[u8]) -> Result<(), Self::Error> {
+            self.transfer(read, write).await
+        }
+
+        async fn transfer_in_place(&mut self, words: &mut [u8]) -> Result<(), Self::Error> {
+            self.transfer_in_place(words).await
+        }
     }
 }
 
 /// GPIO pins for SPIM interface
 pub struct Pins {
-    /// SPI clock.
-    ///
-    /// None if unused.
-    pub sck: Option<Pin<Output<PushPull>>>,
+    /// SPI clock
+    pub sck: Pin<Output<PushPull>>,
 
     /// MOSI Master out, slave in
     /// None if unused
@@ -420,43 +648,88 @@ pub enum Error {
 }
 
 /// Implemented by all SPIM instances.
-pub trait Instance: Deref<Target = spim0::RegisterBlock> + sealed::Sealed {}
+pub trait Instance: Deref<Target = spim0::RegisterBlock> + sealed::Sealed {
+    fn ptr() -> *const spim0::RegisterBlock;
+
+    fn register_waker(waker: &Waker);
+
+    fn unmask_interrupt();
+}
 
 mod sealed {
     pub trait Sealed {}
 }
 
 impl sealed::Sealed for SPIM0 {}
-impl Instance for SPIM0 {}
+impl Instance for SPIM0 {
+    fn ptr() -> *const spim0::RegisterBlock {
+        SPIM0::ptr()
+    }
 
-#[cfg(any(
-    feature = "52832",
-    feature = "52833",
-    feature = "52840",
-    feature = "52811",
-    feature = "9160"
-))]
-mod _spim1 {
-    use super::*;
-    impl Instance for SPIM1 {}
-    impl sealed::Sealed for SPIM1 {}
+    fn register_waker(waker: &Waker) {
+        SPIM0_WAKER.register(waker);
+    }
+
+    fn unmask_interrupt() {
+        unsafe {
+            cortex_m::peripheral::NVIC::unmask(
+                crate::pac::Interrupt::SPIM0_SPIS0_TWIM0_TWIS0_SPI0_TWI0,
+            )
+        };
+    }
 }
 
-#[cfg(any(
-    feature = "52832",
-    feature = "52833",
-    feature = "52840",
-    feature = "9160"
-))]
-mod _spim2 {
-    use super::*;
-    impl Instance for SPIM2 {}
-    impl sealed::Sealed for SPIM2 {}
-}
+impl Instance for SPIM1 {
+    fn ptr() -> *const spim0::RegisterBlock {
+        SPIM1::ptr()
+    }
 
-#[cfg(any(feature = "52833", feature = "52840", feature = "9160"))]
+    fn register_waker(waker: &Waker) {
+        SPIM1_WAKER.register(waker);
+    }
+
+    fn unmask_interrupt() {
+        unsafe {
+            cortex_m::peripheral::NVIC::unmask(
+                crate::pac::Interrupt::SPIM1_SPIS1_TWIM1_TWIS1_SPI1_TWI1,
+            )
+        };
+    }
+}
+impl sealed::Sealed for SPIM1 {}
+
+impl Instance for SPIM2 {
+    fn ptr() -> *const spim0::RegisterBlock {
+        SPIM2::ptr()
+    }
+
+    fn register_waker(waker: &Waker) {
+        SPIM2_WAKER.register(waker);
+    }
+
+    fn unmask_interrupt() {
+        unsafe { cortex_m::peripheral::NVIC::unmask(crate::pac::Interrupt::SPIM2_SPIS2_SPI2) };
+    }
+}
+impl sealed::Sealed for SPIM2 {}
+
+#[cfg(any(feature = "52833", feature = "52840"))]
 mod _spim3 {
     use super::*;
-    impl Instance for SPIM3 {}
+    static SPIM3_WAKER: CriticalSectionWakerRegistration = CriticalSectionWakerRegistration::new();
+
+    impl Instance for SPIM3 {
+        fn ptr() -> *const spim0::RegisterBlock {
+            SPIM3::ptr()
+        }
+
+        fn register_waker(waker: &Waker) {
+            SPIM3_WAKER.register(waker);
+        }
+
+        fn unmask_interrupt() {
+            unsafe { cortex_m::peripheral::NVIC::unmask(crate::pac::Interrupt::SPIM3) };
+        }
+    }
     impl sealed::Sealed for SPIM3 {}
 }
